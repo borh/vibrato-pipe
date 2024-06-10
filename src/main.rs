@@ -125,24 +125,25 @@ fn read_lines_from_stdin<R: BufRead>(
     reader: R,
     format: &str,
     genre: &[String],
-) -> Result<Vec<String>> {
-    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+) -> impl ParallelIterator<Item = String> + Send {
+    let lines = reader.lines();
 
-    Ok(match format {
-        "jsonl" => lines
-            .into_iter()
-            .filter_map(|line| {
-                let value: Value = serde_json::from_str(&line).ok()?;
-                let genres = value.get("genre")?.as_array()?;
-                let genres: Vec<String> = genres
-                    .iter()
-                    .filter_map(|g| g.as_str().map(|s| s.to_string()))
-                    .collect();
+    let iter = if format == "jsonl" {
+        lines
+            .filter_map(move |line| {
+                if let Ok(line) = line {
+                    let value: Value = serde_json::from_str(&line).ok()?;
+                    let genres = value.get("genre")?.as_array()?;
+                    let genres: Vec<String> = genres
+                        .iter()
+                        .filter_map(|g| g.as_str().map(|s| s.to_string()))
+                        .collect();
 
-                if genre.is_empty() || genre.iter().any(|g| genres.contains(g)) {
-                    if let Some(sentences) = value.get("sentences").and_then(|v| v.as_array()) {
+                    if genre.is_empty() || genre.iter().any(|g| genres.contains(g)) {
                         return Some(
-                            sentences
+                            value
+                                .get("sentences")?
+                                .as_array()?
                                 .iter()
                                 .filter_map(|s| s.as_str().map(|s| s.to_string()))
                                 .collect::<Vec<String>>(),
@@ -151,24 +152,35 @@ fn read_lines_from_stdin<R: BufRead>(
                 }
                 None
             })
-            .flatten()
-            .collect(),
-        _ => lines,
-    })
+            .flat_map(|vec| vec.into_iter())
+            .collect::<Vec<_>>()
+            .into_par_iter()
+    } else {
+        lines
+            .filter_map(|line| line.ok().map(|s| vec![s]))
+            .flat_map(|vec| vec.into_iter())
+            .collect::<Vec<_>>()
+            .into_par_iter()
+    };
+
+    iter
 }
 
-fn process_sentences(
-    sentences: Vec<String>,
+fn process_sentences<I>(
+    sentences: I,
     args: &Args,
     join_string: &str,
     search_tokens: &HashSet<String>,
-) -> HashMap<String, u32> {
+) -> HashMap<String, u32>
+where
+    I: ParallelIterator<Item = String> + Send,
+{
     sentences
-        .par_iter()
+        .into_par_iter()
         .map(|sentence| {
             TOKENIZER.with(|tokenizer| {
                 let mut worker = tokenizer.new_worker();
-                worker.reset_sentence(sentence);
+                worker.reset_sentence(&sentence);
                 worker.tokenize();
 
                 let num_tokens = worker.num_tokens();
@@ -345,17 +357,14 @@ fn run(args: Args, reader: impl BufRead) -> Result<()> {
         .build_global()
         .unwrap();
 
-    let sentences = read_lines_from_stdin(reader, &args.format, &args.genre)?;
+    let sentences = read_lines_from_stdin(reader, &args.format, &args.genre);
+    // let sentences_progress = sentences.tqdm();
+
     let histogram = process_sentences(sentences, &args, &join_string, &search_tokens);
     let filtered_histogram = filter_and_sort_histogram(histogram.clone(), args.min_freq);
 
     if args.compute_ngrams {
-        let ngram_counts = extract_ngrams_from_histogram(
-            // Ensure we use the original histogram for n-gram extraction
-            histogram,
-            args.max_tokens,
-            &join_string,
-        );
+        let ngram_counts = extract_ngrams_from_histogram(histogram, args.max_tokens, &join_string);
         let filtered_ngram_counts = filter_and_sort_histogram(ngram_counts, args.min_freq);
         let max_columns = filtered_ngram_counts
             .iter()
@@ -425,7 +434,7 @@ mod tests {
         init();
         let data = "hello\nworld\n";
         let cursor = io::Cursor::new(data);
-        let result = read_lines_from_stdin(cursor, "plain", &[]).unwrap();
+        let result = read_lines_from_stdin(cursor, "plain", &[]).collect::<Vec<_>>();
         assert_eq!(result, vec!["hello".to_string(), "world".to_string()]);
     }
 
@@ -452,7 +461,7 @@ mod tests {
         let search_tokens: HashSet<String> =
             args.search_tokens.split(',').map(String::from).collect();
         let sentences = vec!["ものがいえる".to_string(), "ことができる".to_string()];
-        let result = process_sentences(sentences, &args, "_", &search_tokens);
+        let result = process_sentences(sentences.into_par_iter(), &args, "_", &search_tokens);
         println!("{:?}", result);
         assert!(result.contains_key("もの_が_いえる"));
         assert!(result.contains_key("こと_が_できる"));
@@ -467,7 +476,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let result = extract_ngrams_from_histogram(&histogram, 4, "_");
+        let result = extract_ngrams_from_histogram(histogram, 4, "_");
         println!("{:?}", result);
         assert_eq!(result.get("もの").cloned().unwrap_or(0), 1);
         assert_eq!(result.get("こと_が_できる").cloned().unwrap_or(0), 1);
