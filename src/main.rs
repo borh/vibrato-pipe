@@ -229,9 +229,18 @@ where
                         break;
                     }
 
-                    if let Some(max_tokens) = args.num_tokens {
-                        if stack.len() > max_tokens {
-                            break;
+                    if search_tokens.is_empty() {
+                        if let Some(max_tokens) = args.num_tokens {
+                            if stack.len() >= max_tokens {
+                                let pattern = stack
+                                    .iter()
+                                    .rev()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(&join_string);
+                                *local_histogram.entry(pattern).or_insert(0) += 1;
+                                break;
+                            }
                         }
                     }
                 }
@@ -349,7 +358,11 @@ fn run(args: Args, reader: impl BufRead) -> Result<()> {
     let delimiter = parse_escape_sequences(&args.output_delimiter);
     let join_string = parse_escape_sequences(&args.join_string);
     let genres = args.genre.join(",");
-    let search_tokens: HashSet<String> = args.search_tokens.split(',').map(String::from).collect();
+    let search_tokens: HashSet<String> = if args.search_tokens.is_empty() {
+        HashSet::new()
+    } else {
+        args.search_tokens.split(',').map(String::from).collect()
+    };
 
     // Configure the number of threads for Rayon
     ThreadPoolBuilder::new()
