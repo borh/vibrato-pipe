@@ -63,7 +63,7 @@ struct Args {
     #[arg(long, default_value = "もの,こと,と")]
     search_tokens: String,
 
-    /// Output mode: "default" or "csv"
+    /// Output mode: "default", "csv", or "print"
     #[arg(long, default_value = "default")]
     output_mode: String,
 
@@ -166,6 +166,79 @@ fn read_lines_from_stdin<R: BufRead>(
     iter
 }
 
+fn match_tokens(
+    sentence: &str,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    search_tokens: &HashSet<String>,
+    join_string: &str,
+) -> Option<String> {
+    let mut worker = tokenizer.new_worker();
+    worker.reset_sentence(sentence);
+    worker.tokenize();
+
+    let num_tokens = worker.num_tokens();
+    if num_tokens == 0 {
+        return None;
+    }
+
+    let mut end_index = num_tokens;
+
+    if args.ignore_punctuation {
+        while end_index > 0 {
+            let feature = worker.token(end_index - 1).feature();
+            if feature.split(',').next() == Some("補助記号") {
+                end_index -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut stack = Vec::new();
+
+    for i in (0..end_index).rev() {
+        let token = worker.token(i);
+        let surface = token.surface().to_string();
+        let feature = token.feature();
+        if feature.split(',').next() == Some("補助記号") {
+            continue;
+        }
+
+        if surface == "、" || surface == "，" || surface == "," {
+            break;
+        }
+
+        stack.push(surface.clone());
+
+        if search_tokens.contains(&surface) {
+            let pattern = stack
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(join_string);
+            return Some(pattern);
+        }
+
+        if search_tokens.is_empty() {
+            if let Some(max_tokens) = args.num_tokens {
+                if stack.len() >= max_tokens {
+                    let pattern = stack
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(join_string);
+                    return Some(pattern);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn process_sentences<I>(
     sentences: I,
     args: &Args,
@@ -179,73 +252,13 @@ where
         .into_par_iter()
         .map(|sentence| {
             TOKENIZER.with(|tokenizer| {
-                let mut worker = tokenizer.new_worker();
-                worker.reset_sentence(&sentence);
-                worker.tokenize();
-
-                let num_tokens = worker.num_tokens();
-                if num_tokens == 0 {
-                    return HashMap::new();
-                }
-
-                let mut end_index = num_tokens;
-
-                if args.ignore_punctuation {
-                    while end_index > 0 {
-                        let feature = worker.token(end_index - 1).feature();
-                        if feature.split(',').next() == Some("補助記号") {
-                            end_index -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                let mut local_histogram = HashMap::new();
-                let mut stack = Vec::new();
-
-                for i in (0..end_index).rev() {
-                    let token = worker.token(i);
-                    let surface = token.surface().to_string();
-                    let feature = token.feature();
-                    if feature.split(',').next() == Some("補助記号") {
-                        continue;
-                    }
-
-                    if surface == "、" || surface == "，" || surface == "," {
-                        break;
-                    }
-
-                    stack.push(surface.clone());
-
-                    if search_tokens.contains(&surface) {
-                        let pattern = stack
-                            .iter()
-                            .rev()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(&join_string);
+                match_tokens(&sentence, tokenizer, args, search_tokens, join_string)
+                    .map(|pattern| {
+                        let mut local_histogram = HashMap::new();
                         *local_histogram.entry(pattern).or_insert(0) += 1;
-                        break;
-                    }
-
-                    if search_tokens.is_empty() {
-                        if let Some(max_tokens) = args.num_tokens {
-                            if stack.len() >= max_tokens {
-                                let pattern = stack
-                                    .iter()
-                                    .rev()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(&join_string);
-                                *local_histogram.entry(pattern).or_insert(0) += 1;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                local_histogram
+                        local_histogram
+                    })
+                    .unwrap_or_default()
             })
         })
         .reduce(HashMap::new, |mut acc, local_histogram| {
@@ -354,6 +367,25 @@ fn output_histogram_results(
     }
 }
 
+fn output_matching_sentences<I>(
+    sentences: I,
+    args: &Args,
+    join_string: &str,
+    search_tokens: &HashSet<String>,
+) where
+    I: ParallelIterator<Item = String> + Send,
+{
+    sentences.into_par_iter().for_each(|sentence| {
+        TOKENIZER.with(|tokenizer| {
+            if let Some(_pattern) =
+                match_tokens(&sentence, tokenizer, args, search_tokens, join_string)
+            {
+                println!("{}", sentence);
+            }
+        });
+    });
+}
+
 fn run(args: Args, reader: impl BufRead) -> Result<()> {
     let delimiter = parse_escape_sequences(&args.output_delimiter);
     let join_string = parse_escape_sequences(&args.join_string);
@@ -371,41 +403,45 @@ fn run(args: Args, reader: impl BufRead) -> Result<()> {
         .unwrap();
 
     let sentences = read_lines_from_stdin(reader, &args.format, &args.genre);
-    // let sentences_progress = sentences.tqdm();
 
-    let histogram = process_sentences(sentences, &args, &join_string, &search_tokens);
-    let filtered_histogram = filter_and_sort_histogram(histogram.clone(), args.min_freq);
-
-    if args.compute_ngrams {
-        let ngram_counts = extract_ngrams_from_histogram(histogram, args.max_tokens, &join_string);
-        let filtered_ngram_counts = filter_and_sort_histogram(ngram_counts, args.min_freq);
-        let max_columns = filtered_ngram_counts
-            .iter()
-            .map(|(pattern, _)| pattern.split(&delimiter).count())
-            .max()
-            .unwrap_or(0);
-        output_histogram_results(
-            filtered_ngram_counts,
-            &delimiter,
-            args.top_k,
-            &genres,
-            &args.output_mode,
-            max_columns,
-        );
+    if args.output_mode == "print" {
+        output_matching_sentences(sentences, &args, &join_string, &search_tokens);
     } else {
-        let max_columns = filtered_histogram
-            .iter()
-            .map(|(pattern, _)| pattern.split(&delimiter).count())
-            .max()
-            .unwrap_or(0);
-        output_histogram_results(
-            filtered_histogram,
-            &delimiter,
-            args.top_k,
-            &genres,
-            &args.output_mode,
-            max_columns,
-        );
+        let histogram = process_sentences(sentences, &args, &join_string, &search_tokens);
+        let filtered_histogram = filter_and_sort_histogram(histogram.clone(), args.min_freq);
+
+        if args.compute_ngrams {
+            let ngram_counts =
+                extract_ngrams_from_histogram(histogram, args.max_tokens, &join_string);
+            let filtered_ngram_counts = filter_and_sort_histogram(ngram_counts, args.min_freq);
+            let max_columns = filtered_ngram_counts
+                .iter()
+                .map(|(pattern, _)| pattern.split(&delimiter).count())
+                .max()
+                .unwrap_or(0);
+            output_histogram_results(
+                filtered_ngram_counts,
+                &delimiter,
+                args.top_k,
+                &genres,
+                &args.output_mode,
+                max_columns,
+            );
+        } else {
+            let max_columns = filtered_histogram
+                .iter()
+                .map(|(pattern, _)| pattern.split(&delimiter).count())
+                .max()
+                .unwrap_or(0);
+            output_histogram_results(
+                filtered_histogram,
+                &delimiter,
+                args.top_k,
+                &genres,
+                &args.output_mode,
+                max_columns,
+            );
+        }
     }
 
     Ok(())
